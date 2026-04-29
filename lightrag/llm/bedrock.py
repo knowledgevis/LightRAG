@@ -1,3 +1,6 @@
+# modifications made April 2026 to update bedrock invokeModel format
+# since AWS migrated to Nova 2 models.
+
 import copy
 import os
 import json
@@ -240,8 +243,8 @@ async def bedrock_complete_if_cache(
 
             try:
                 # Make the API call
-                print("Starting Bedrock streaming response...")
-                print(f"API call arguments: {args}")
+                #print("Starting Bedrock streaming response...")
+                #print(f"API call arguments: {args}")
                 response = await client.converse_stream(**args, **kwargs)
                 event_stream = response.get("stream")
                 iteration_started = True
@@ -313,8 +316,8 @@ async def bedrock_complete_if_cache(
     ) as bedrock_async_client:
         try:
             # Use converse for non-streaming responses
-            print("Starting Bedrock async response...")
-            print(f"API call arguments: {args}")
+            #print("Starting Bedrock async response...")
+            #print(f"API call arguments: {args}")
             response = await bedrock_async_client.converse(**args, **kwargs)
 
             # Validate response structure
@@ -418,7 +421,7 @@ async def bedrock_embed(
 
                         else:
                             raise BedrockError(f"Model {model} is not supported!")
-                        print(f"Embedding API call for text body: {request_body}")
+                        #print(f"Embedding API call for text body: {request_body}")
                         response = await bedrock_async_client.invoke_model(
                             modelId=model,
                             body=json.dumps(request_body,indent=2),
@@ -466,7 +469,7 @@ async def bedrock_embed(
                     )
 
                     response_body = json.loads(response.get("body").read())
-                    print(f"Embedding API response: {json.dumps(response_body, indent=2)}")
+                    #print(f"Embedding API response: {json.dumps(response_body, indent=2)}")
 
                     # Validate response structure
                     if not response_body or "embeddings" not in response_body:
