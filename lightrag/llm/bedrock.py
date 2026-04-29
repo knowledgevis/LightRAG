@@ -1,3 +1,6 @@
+# modifications made April 2026 to update bedrock invokeModel format
+# since AWS migrated to Nova 2 models.
+
 import copy
 import os
 import json
@@ -240,6 +243,8 @@ async def bedrock_complete_if_cache(
 
             try:
                 # Make the API call
+                #print("Starting Bedrock streaming response...")
+                #print(f"API call arguments: {args}")
                 response = await client.converse_stream(**args, **kwargs)
                 event_stream = response.get("stream")
                 iteration_started = True
@@ -311,6 +316,8 @@ async def bedrock_complete_if_cache(
     ) as bedrock_async_client:
         try:
             # Use converse for non-streaming responses
+            #print("Starting Bedrock async response...")
+            #print(f"API call arguments: {args}")
             response = await bedrock_async_client.converse(**args, **kwargs)
 
             # Validate response structure
@@ -352,7 +359,8 @@ async def bedrock_complete(
 
 
 @wrap_embedding_func_with_attrs(
-    embedding_dim=1024, max_token_size=8192, model_name="amazon.titan-embed-text-v2:0"
+    #embedding_dim=1024, max_token_size=8192, model_name="amazon.titan-embed-text-v2:0"
+    embedding_dim=1024, max_token_size=8192, model_name="amazon.nova-2-multimodal-embeddings-v1:0"
 )
 @retry(
     stop=stop_after_attempt(5),
@@ -365,7 +373,7 @@ async def bedrock_complete(
 )
 async def bedrock_embed(
     texts: list[str],
-    model: str = "amazon.titan-embed-text-v2:0",
+    model: str = "amazon.nova-2-multimodal-embeddings-v1:0",
     aws_access_key_id=None,
     aws_secret_access_key=None,
     aws_session_token=None,
@@ -374,9 +382,11 @@ async def bedrock_embed(
     access_key = os.environ.get("AWS_ACCESS_KEY_ID") or aws_access_key_id
     secret_key = os.environ.get("AWS_SECRET_ACCESS_KEY") or aws_secret_access_key
     session_token = os.environ.get("AWS_SESSION_TOKEN") or aws_session_token
+    embedding_dimension = os.environ.get("EMBEDDING_DIM", 1024)
     _set_env_if_present("AWS_ACCESS_KEY_ID", access_key)
     _set_env_if_present("AWS_SECRET_ACCESS_KEY", secret_key)
     _set_env_if_present("AWS_SESSION_TOKEN", session_token)
+
 
     # Region handling: prefer env
     region = os.environ.get("AWS_REGION")
@@ -399,13 +409,22 @@ async def bedrock_embed(
                                 }
                             )
                         elif "v1" in model:
-                            body = json.dumps({"inputText": text})
+                            # see page paage 26 of the Nova 2 user guide for format details
+                            request_body = {
+                                'taskType': 'SINGLE_EMBEDDING',
+                                'singleEmbeddingParams': {
+                                    'embeddingPurpose': 'GENERIC_INDEX',
+                                    'embeddingDimension': int(embedding_dimension),
+                                    'text': {'truncationMode': 'END', 'value': text},
+                                    },
+                            }   
+
                         else:
                             raise BedrockError(f"Model {model} is not supported!")
-
+                        #print(f"Embedding API call for text body: {request_body}")
                         response = await bedrock_async_client.invoke_model(
                             modelId=model,
-                            body=body,
+                            body=json.dumps(request_body,indent=2),
                             accept="application/json",
                             contentType="application/json",
                         )
@@ -413,12 +432,12 @@ async def bedrock_embed(
                         response_body = await response.get("body").json()
 
                         # Validate response structure
-                        if not response_body or "embedding" not in response_body:
+                        if not response_body or "embeddings" not in response_body:
                             raise BedrockError(
                                 f"Invalid embedding response structure for text: {text[:50]}..."
                             )
 
-                        embedding = response_body["embedding"]
+                        embedding = response_body["embeddings"][0]["embedding"]
                         if not embedding:
                             raise BedrockError(
                                 f"Received empty embedding for text: {text[:50]}..."
@@ -450,6 +469,7 @@ async def bedrock_embed(
                     )
 
                     response_body = json.loads(response.get("body").read())
+                    #print(f"Embedding API response: {json.dumps(response_body, indent=2)}")
 
                     # Validate response structure
                     if not response_body or "embeddings" not in response_body:
