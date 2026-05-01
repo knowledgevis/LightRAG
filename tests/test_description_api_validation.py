@@ -5,7 +5,10 @@ from lightrag.constants import GRAPH_FIELD_SEP
 from lightrag.operate import (
     _merge_nodes_then_upsert,
     _handle_single_relationship_extraction,
+    _deduplicate_chunk_result_entity_names,
+    lookup_canonical_name,
 )
+import lightrag.operate as operate_module
 from lightrag import utils_graph
 
 
@@ -219,6 +222,137 @@ def test_handle_single_relationship_extraction_ignores_empty_description():
     )
 
     assert relation is None
+
+
+def test_lookup_canonical_name_stub_is_identity():
+    """Default stub must return the name unchanged."""
+    assert lookup_canonical_name("Apple") == "Apple"
+    assert lookup_canonical_name("some entity") == "some entity"
+
+
+def test_deduplicate_uses_lookup_canonical_name(monkeypatch):
+    """Replacing lookup_canonical_name lets callers inject synonym resolution."""
+    monkeypatch.setattr(
+        operate_module,
+        "lookup_canonical_name",
+        lambda name: "Apple Inc" if name.lower() == "apple" else name,
+    )
+
+    chunk_results = [
+        (
+            {
+                "apple": [
+                    {
+                        "entity_name": "apple",
+                        "entity_type": "org",
+                        "description": "Fruit company",
+                        "source_id": "chunk-1",
+                    }
+                ]
+            },
+            {},
+        )
+    ]
+
+    deduped = _deduplicate_chunk_result_entity_names(chunk_results)
+    deduped_nodes, _ = deduped[0]
+
+    assert "Apple Inc" in deduped_nodes
+    assert "apple" not in deduped_nodes
+
+
+def test_deduplicate_chunk_result_entity_names_merges_case_variants():
+    chunk_results = [
+        (
+            {
+                "Apple": [
+                    {
+                        "entity_name": "Apple",
+                        "entity_type": "org",
+                        "description": "Company",
+                        "source_id": "chunk-1",
+                    }
+                ]
+            },
+            {
+                ("apple", "iPhone"): [
+                    {
+                        "src_id": "apple",
+                        "tgt_id": "iPhone",
+                        "description": "makes",
+                        "keywords": "manufacturer",
+                        "source_id": "chunk-1",
+                        "weight": 1.0,
+                    }
+                ]
+            },
+        )
+    ]
+
+    deduped = _deduplicate_chunk_result_entity_names(chunk_results)
+    deduped_nodes, deduped_edges = deduped[0]
+
+    assert "Apple" in deduped_nodes
+    assert "apple" not in deduped_nodes
+
+    only_edge_key = next(iter(deduped_edges.keys()))
+    assert only_edge_key[0] == "Apple"
+    assert deduped_edges[only_edge_key][0]["src_id"] == "Apple"
+
+
+def test_deduplicate_chunk_result_entity_names_keeps_singular_plural_separate():
+    chunk_results = [
+        (
+            {
+                "Dog": [
+                    {
+                        "entity_name": "Dog",
+                        "entity_type": "animal",
+                        "description": "single",
+                        "source_id": "chunk-1",
+                    }
+                ],
+                "Dogs": [
+                    {
+                        "entity_name": "Dogs",
+                        "entity_type": "animal",
+                        "description": "plural",
+                        "source_id": "chunk-2",
+                    }
+                ],
+            },
+            {
+                ("Dog", "Pets"): [
+                    {
+                        "src_id": "Dog",
+                        "tgt_id": "Pets",
+                        "description": "belongs_to",
+                        "keywords": "taxonomy",
+                        "source_id": "chunk-1",
+                        "weight": 1.0,
+                    }
+                ],
+                ("Dogs", "Parks"): [
+                    {
+                        "src_id": "Dogs",
+                        "tgt_id": "Parks",
+                        "description": "visit",
+                        "keywords": "activity",
+                        "source_id": "chunk-2",
+                        "weight": 1.0,
+                    }
+                ],
+            },
+        )
+    ]
+
+    deduped = _deduplicate_chunk_result_entity_names(chunk_results)
+    deduped_nodes, deduped_edges = deduped[0]
+
+    assert "Dog" in deduped_nodes
+    assert "Dogs" in deduped_nodes
+    assert any("Dog" in key for key in deduped_edges.keys())
+    assert any("Dogs" in key for key in deduped_edges.keys())
 
 
 @pytest.mark.asyncio

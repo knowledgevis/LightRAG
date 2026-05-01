@@ -2498,6 +2498,109 @@ async def _merge_edges_then_upsert(
         )
 
 
+def lookup_canonical_name(entity_name: str) -> str:
+    """Return the canonical form of an entity name.
+
+    This stub always returns the name unchanged.  Replace it with a real
+    implementation (e.g. a dictionary lookup or synonym-resolver) to map
+    variant spellings, abbreviations, or aliases onto a single preferred
+    name before the deduplication pass runs.
+
+    Args:
+        entity_name: Raw entity name as produced by the LLM extractor.
+
+    Returns:
+        Canonical entity name to be stored in the knowledge graph.
+    """
+    return entity_name
+
+
+def _normalize_entity_name_for_dedup(entity_name: str) -> str:
+    """Normalize entity names for dedup comparison without changing storage display."""
+    return " ".join((entity_name or "").split()).strip().lower()
+
+
+def _is_singular_plural_pair(first_name: str, second_name: str) -> bool:
+    """Return True when names are simple singular/plural variants (trailing 's')."""
+    first = _normalize_entity_name_for_dedup(first_name)
+    second = _normalize_entity_name_for_dedup(second_name)
+
+    if not first or not second or first == second:
+        return False
+
+    return (first.endswith("s") and first[:-1] == second) or (
+        second.endswith("s") and second[:-1] == first
+    )
+
+
+def _deduplicate_chunk_result_entity_names(chunk_results: list) -> list:
+    """Canonicalize duplicate entity names across chunk results before graph merge.
+
+    Names are deduplicated case-insensitively after whitespace normalization.
+    Singular/plural pairs (simple trailing "s") are intentionally kept separate.
+    """
+    canonical_by_normalized: dict[str, str] = {}
+    deduped_chunk_results = []
+    merged_name_count = 0
+    skipped_plural_pairs = 0
+
+    def _resolve_canonical_name(entity_name: str) -> str:
+        nonlocal merged_name_count, skipped_plural_pairs
+
+        # Apply user-supplied canonical-name mapping first (stub by default).
+        entity_name = lookup_canonical_name(entity_name)
+
+        normalized_name = _normalize_entity_name_for_dedup(entity_name)
+        existing_name = canonical_by_normalized.get(normalized_name)
+
+        if existing_name is None:
+            canonical_by_normalized[normalized_name] = entity_name
+            return entity_name
+
+        if existing_name == entity_name:
+            return entity_name
+
+        if _is_singular_plural_pair(existing_name, entity_name):
+            skipped_plural_pairs += 1
+            return entity_name
+
+        merged_name_count += 1
+        return existing_name
+
+    for maybe_nodes, maybe_edges in chunk_results:
+        deduped_nodes = defaultdict(list)
+        deduped_edges = defaultdict(list)
+
+        for entity_name, entities in maybe_nodes.items():
+            canonical_name = _resolve_canonical_name(entity_name)
+            for entity_data in entities:
+                updated_entity_data = dict(entity_data)
+                updated_entity_data["entity_name"] = canonical_name
+                deduped_nodes[canonical_name].append(updated_entity_data)
+
+        for edge_key, edges in maybe_edges.items():
+            source_name = _resolve_canonical_name(edge_key[0])
+            target_name = _resolve_canonical_name(edge_key[1])
+            canonical_edge_key = tuple(sorted((source_name, target_name)))
+
+            for edge_data in edges:
+                updated_edge_data = dict(edge_data)
+                updated_edge_data["src_id"] = source_name
+                updated_edge_data["tgt_id"] = target_name
+                deduped_edges[canonical_edge_key].append(updated_edge_data)
+
+        deduped_chunk_results.append((dict(deduped_nodes), dict(deduped_edges)))
+
+    if merged_name_count > 0 or skipped_plural_pairs > 0:
+        logger.info(
+            "Entity-name deduplication: merged=%d, skipped_plural_pairs=%d",
+            merged_name_count,
+            skipped_plural_pairs,
+        )
+
+    return deduped_chunk_results
+
+
 async def merge_nodes_and_edges(
     chunk_results: list,
     knowledge_graph_inst: BaseGraphStorage,
@@ -2547,6 +2650,8 @@ async def merge_nodes_and_edges(
         async with pipeline_status_lock:
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled during merge phase")
+
+    chunk_results = _deduplicate_chunk_result_entity_names(chunk_results)
 
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
