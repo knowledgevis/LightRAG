@@ -2497,13 +2497,27 @@ async def _merge_edges_then_upsert(
             time.perf_counter() - timing_start,
         )
 
+'''
+The following routines were added to remove the instance of duplicate or 
+near-duplicate entity names across chunk results before the graph merge phase.
+This is necessary because the same entity may be extracted from multiple chunks with 
+slight variations in name (e.g. "New York", "new york ", "New York City"), and we want to 
+ensure they are merged as the same node in the graph.  An external canonical name lookup 
+function is provided.  A JSON dictionary file is loaded as a lookup of query name to canonical
+name.  Then plurals (with an 's' suffix) are  merged to keep them consistent.  
+The deduplication is done in a way that preserves the original entity name for display/storage, 
+while ensuring consistent canonical names for merging and vectorization.
+'''
+
+# dictionary used to map from query term to canonical term, loaded from a JSON file 
+# specified in global_config
+
+canonicalNamesDictionary = {}
 
 def lookup_canonical_name(entity_name: str) -> str:
     """Return the canonical form of an entity name.
 
-    This stub always returns the name unchanged.  Replace it with a real
-    implementation (e.g. a dictionary lookup or synonym-resolver) to map
-    variant spellings, abbreviations, or aliases onto a single preferred
+    map variant spellings, abbreviations, or aliases onto a single preferred
     name before the deduplication pass runs.
 
     Args:
@@ -2512,7 +2526,26 @@ def lookup_canonical_name(entity_name: str) -> str:
     Returns:
         Canonical entity name to be stored in the knowledge graph.
     """
+    global canonicalNamesDictionary
+
+    if entity_name in canonicalNamesDictionary.keys():
+        if canonicalNamesDictionary[entity_name] != entity_name:
+            logger.debug(
+                f"Mapping entity name `{entity_name}` to canonical name `{canonicalNamesDictionary[entity_name]}`"
+            )   
+        return canonicalNamesDictionary[entity_name]
+    else:
+        return entity_name
+
+
     return entity_name
+
+# load the lookup dictionary used to map from query term to canonical term
+def _load_canonical_terms(filepath):
+    print(f"Loading canonical names dictionary from {filepath}...")
+    with open(filepath, 'r') as f:
+        new_dict = json.load(f)
+    return new_dict
 
 
 def _normalize_entity_name_for_dedup(entity_name: str) -> str:
@@ -2528,32 +2561,73 @@ def _is_singular_plural_pair(first_name: str, second_name: str) -> bool:
     if not first or not second or first == second:
         return False
 
-    return (first.endswith("s") and first[:-1] == second) or (
-        second.endswith("s") and second[:-1] == first
-    )
+    # if there is a singular/plural pair, we consider them the same for deduplication purposes
+    found = (first.endswith("s") and first[:-1] == second) or (second.endswith("s") and second[:-1] == first)
+    if found:
+        logger.debug(f"Identified singular/plural pair for deduplication: `{first_name}` and `{second_name}`")  
+
+    return  found
 
 
-def _deduplicate_chunk_result_entity_names(chunk_results: list) -> list:
+
+def _deduplicate_chunk_result_entity_names(chunk_results: list, global_config: dict[str, str] | None = None) -> list:
     """Canonicalize duplicate entity names across chunk results before graph merge.
 
     Names are deduplicated case-insensitively after whitespace normalization.
-    Singular/plural pairs (simple trailing "s") are intentionally kept separate.
+    Singular/plural pairs (simple trailing "s") are merged to the singular form.
+    A mapping dictionary is loaded once per chunk to resolve known variants to canonical names.
+    
+    Args:
+        chunk_results: List of (nodes, edges) tuples from extraction.
+        global_config: Configuration dict containing optional 'canonical_mapping_dict_path' key.
     """
+
+    global canonicalNamesDictionary
     canonical_by_normalized: dict[str, str] = {}
     deduped_chunk_results = []
     merged_name_count = 0
     skipped_plural_pairs = 0
 
+    # Get the dictionary path from global_config or use default
+    dict_path = '../canonical_mapping_dictionary.json'
+    if global_config:
+        dict_path = global_config.get('canonical_mapping_dict_path', dict_path)
+
+    # initial load of dictionary (maybe repeated for each chunk, but not for each entity)
+    try:
+        canonicalNamesDictionary = _load_canonical_terms(dict_path)
+        print('loaded canonical names dictionary',flush=True)
+    except Exception as e:
+        logger.warning("Failed to load canonical names dictionary from %s: %s", dict_path, e)
+
     def _resolve_canonical_name(entity_name: str) -> str:
         nonlocal merged_name_count, skipped_plural_pairs
 
-        # Apply user-supplied canonical-name mapping first (stub by default).
+        # Apply user-supplied canonical-name mapping first
         entity_name = lookup_canonical_name(entity_name)
 
         normalized_name = _normalize_entity_name_for_dedup(entity_name)
         existing_name = canonical_by_normalized.get(normalized_name)
-
         if existing_name is None:
+            # Check for singular/plural variants and merge them
+            if entity_name.endswith('s'):
+                # Try singular form; look for special plural case of "ies" -> "y"
+                if entity_name.endswith('ies'):
+                    singular_form = entity_name[:-3] + 'y'
+                else:
+                    singular_form = entity_name[:-1]
+                singular_normalized = _normalize_entity_name_for_dedup(singular_form)
+                if singular_normalized in canonical_by_normalized:
+                    merged_name_count += 1
+                    return canonical_by_normalized[singular_normalized]
+            else:
+                # Try plural form
+                plural_form = entity_name + 's'
+                plural_normalized = _normalize_entity_name_for_dedup(plural_form)
+                if plural_normalized in canonical_by_normalized:
+                    merged_name_count += 1
+                    return canonical_by_normalized[plural_normalized]
+            
             canonical_by_normalized[normalized_name] = entity_name
             return entity_name
 
@@ -2561,8 +2635,11 @@ def _deduplicate_chunk_result_entity_names(chunk_results: list) -> list:
             return entity_name
 
         if _is_singular_plural_pair(existing_name, entity_name):
-            skipped_plural_pairs += 1
-            return entity_name
+            # Merge to the singular form (without trailing 's')
+            singular = existing_name if not existing_name.endswith('s') else entity_name
+            canonical_by_normalized[normalized_name] = singular
+            merged_name_count += 1
+            return singular
 
         merged_name_count += 1
         return existing_name
@@ -2651,7 +2728,8 @@ async def merge_nodes_and_edges(
             if pipeline_status.get("cancellation_requested", False):
                 raise PipelineCancelledException("User cancelled during merge phase")
 
-    chunk_results = _deduplicate_chunk_result_entity_names(chunk_results)
+    print('attempting de-dup of chunk result entity names...', flush=True)
+    chunk_results = _deduplicate_chunk_result_entity_names(chunk_results, global_config)
 
     # Collect all nodes and edges from all chunks
     all_nodes = defaultdict(list)
